@@ -300,6 +300,19 @@ sudo tc qdisc add dev mq0 root tbf rate 4mbit burst 32kbit latency 50ms  # cap f
 - **Uptime:** the ESP can hang under load; a smart plug that power-cycles it
   nightly is a cheap fix.
 
+# Policies — protecting your home and your users
+
+Publish the first two to your users; follow the third yourself before going
+live:
+
+- [policy/PRIVACY.md](policy/PRIVACY.md) — what the operator can and cannot
+  see, logging practices, and legal-request handling.
+- [policy/ACCEPTABLE_USE.md](policy/ACCEPTABLE_USE.md) — rules users must
+  agree to; everything that exits the Pi is the operator's responsibility.
+- [policy/PI-HARDENING.md](policy/PI-HARDENING.md) — step-by-step hardening:
+  SSH lockdown, firewalls, **blocking tunnel users from reaching your home
+  LAN**, WiFi isolation, auto-updates, and abuse monitoring.
+
 ## Credits
 
 Tunnel firmware and Linux client by

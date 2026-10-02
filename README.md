@@ -1,61 +1,59 @@
 # ESP8266 MQTT VPN — Community Hotspot
 
-Turn a $3 ESP8266 into a tiny VPN hotspot that tunnels everyone's traffic
-through an MQTT broker to an exit node on an uncensored network. Based on
+Turn a $3 ESP8266 (WeMos D1 Mini / NodeMCU) into a tiny VPN hotspot. Users
+join its WiFi and all their traffic is tunneled through an MQTT broker to a
+Raspberry Pi exit node on an uncensored network. Based on
 [martin-ger/MQTT_VPN](https://github.com/martin-ger/MQTT_VPN).
 
 ```
 +-----------+   WiFi    +-----------+  MQTT (TLS)  +--------------+   Internet
-| Laptops,  |<--------->|  ESP8266  |<------------>| MQTT broker  |
-| phones    |  hotspot  | (NAT/tun) |              +------+-------+
-+-----------+           +-----------+                     |
-                                                   tunnels packets
-                                                         |
-                                                         v
-                                                +------------------+
-                                                | Linux exit node  |
-                                                | (mqtt_vpn + NAT) |
-                                                +------------------+
+| Chrome-   |<--------->|  WeMos    |<------------>| MQTT broker  |
+| book      |  hotspot  |  ESP8266  |              +------+-------+
++-----------+           | (NAT/tun) |                     |
+                        +-----------+               tunnels packets
+                                                            |
+                                                            v
+                                                   +------------------+
+                                                   | Raspberry Pi     |
+                                                   | (mqtt_vpn + NAT) |
+                                                   +------------------+
 ```
-
-Users just join the ESP's WiFi hotspot — no per-device config. The ESP NATs
-all clients behind a single encrypted IP-over-MQTT tunnel.
 
 ---
 
-## Repo layout
+# Devices you need
 
-```
-firmware/mqtt_vpn_hotspot.ino   ESP8266 hotspot firmware (flash this)
-api/webhooks/dodo/webhook_server.py   Paid-tier provisioning webhook
-api/webhooks/dodo/README.md     Webhook receiver docs
-```
-
-Everything else you need to know is in **this file only**.
-
----
-
-## 1. What you need
-
-| Part | Example | ~Cost |
+| Device | Role | ~Cost |
 |---|---|---|
-| ESP8266 dev board | NodeMCU v3 / Wemos D1 Mini | $3–5 |
-| Micro-USB data cable + PC | for flashing | $2 |
-| MQTT broker | HiveMQ Cloud free (TLS) or Mosquitto | $0 |
-| Linux exit node | Raspberry Pi / spare PC / ~$5 VPS | $0–5/mo |
+| **WeMos D1 Mini** (or any ESP8266: NodeMCU v3 etc.) + micro-USB data cable | The hotspot: broadcasts its own WiFi, tunnels everyone through the broker | $3–5 |
+| **Raspberry Pi** (any model, ideally 3/4/Zero 2 W) + SD card | The exit node **and** the MQTT broker — all traffic exits here | $0–35 (use one you have) |
+| **Chromebook** (or any laptop/phone) | The client — just joins the hotspot WiFi | — |
 
-> Tip: run Mosquitto on the same Linux exit node — one box, one address.
+> One computer plays two roles: the Raspberry Pi runs **both** the MQTT broker
+> (Mosquitto) and the tunnel client (`mqtt_vpn`). That keeps the whole setup
+> on two devices + one charger.
 
-## 2. Set up the MQTT broker
+Optional: a micro-USB **power** adapter for the WeMos (it can't run off the Pi
+reliably), and the PC you'll use to flash the WeMos (any laptop works, even
+the Chromebook itself via Linux mode).
 
-### Option A — Mosquitto on the exit node (recommended)
+---
+
+# Step 1 — Set up the Raspberry Pi (broker + exit node)
+
+You'll need the Pi running Raspberry Pi OS (Lite is fine), reachable via
+SSH or a keyboard/screen. Everything below happens **on the Pi**.
+
+### 1.1 Install the MQTT broker (Mosquitto)
 
 ```bash
-sudo apt update && sudo apt install -y mosquitto mosquitto-clients
+sudo apt update
+sudo apt install -y mosquitto mosquitto-clients
 sudo mosquitto_passwd -c /etc/mosquitto/passwd vpnuser
+# → type a strong password twice. Remember it: it's BROKER_PASS everywhere.
 ```
 
-`/etc/mosquitto/conf.d/vpn.conf`:
+Create `/etc/mosquitto/conf.d/vpn.conf`:
 
 ```
 listener 8883
@@ -65,57 +63,75 @@ certfile /etc/mosquitto/certs/ca.crt
 keyfile  /etc/mosquitto/certs/ca.key
 ```
 
+Generate a free self-signed TLS certificate:
+
 ```bash
-sudo systemctl restart mosquitto
-sudo ufw allow 8883/tcp
+sudo mkdir -p /etc/mosquitto/certs
+sudo openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+  -keyout /etc/mosquitto/certs/ca.key -out /etc/mosquitto/certs/ca.crt \
+  -subj "/CN=vpn-broker"
 ```
 
-If behind home NAT, port-forward **TCP 8883** to the node. Note its public IP
-(`curl ifconfig.me`).
+Start it and open the firewall:
 
-### Option B — HiveMQ Cloud (managed, free tier)
+```bash
+sudo systemctl restart mosquitto
+sudo ufw allow 8883/tcp    # skip if ufw is not enabled
+```
 
-Sign up, create a cluster, note the URL (`xxx.s1.eu.hivemq.cloud:8883`) and
-create username/password credentials under Access Management.
+### 1.2 Give the Pi a reachable address
 
-## 3. Prepare the exit node
+- **Pi at home:** enable SSH, then in your **router** forward TCP 8883 to the
+  Pi. Note your home public IP (`curl ifconfig.me`) — or set up a free
+  dynamic-DNS name at duckdns.org if your IP changes.
+- **Pi at a site with an open network:** the network's IP may be all you need.
+
+This address is your **BROKER_HOST** used in Step 2 and Step 3.
+
+### 1.3 Build the VPN client
 
 ```bash
 sudo apt install -y git build-essential cmake
 git clone https://github.com/martin-ger/MQTT_VPN.git
 cd MQTT_VPN/linux
-sudo ./mqttVPNdependencyInstaller.sh     # builds ./mqtt_vpn
+sudo ./mqttVPNdependencyInstaller.sh      # builds ./mqtt_vpn
 ```
 
-Enable forwarding + NAT:
+### 1.4 Enable IP forwarding + NAT
 
 ```bash
 echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-vpn.conf
 sudo sysctl -p /etc/sysctl.d/99-vpn.conf
-ip route get 1.1.1.1                      # find outbound interface, e.g. eth0
-sudo iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+ip route get 1.1.1.1                       # note the outbound iface, e.g. wlan0/eth0
+sudo iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE   # use your iface
 sudo apt install -y iptables-persistent && sudo netfilter-persistent save
 ```
 
-Run the client (one instance per tier — see §6):
+### 1.5 Run the tunnel client
+
+Pick a **VPN preshared key** — any long random string, e.g.
+`openssl rand -hex 32`. It must match the ESP's `vpn_password` (Step 2).
 
 ```bash
-sudo ./mqtt_vpn -i mq0 -a 10.0.1.1 \
-  -b tls://YOUR_BROKER_HOST:8883 \
+sudo ./mqtt_vpn \
+  -i mq0 \
+  -a 10.0.1.1 \
+  -b tls://BROKER_HOST:8883 \
   -u vpnuser -p BROKER_PASSWORD \
-  -k "standard-key-here" -d
+  -k "your-preshared-key" -d
 ```
 
-Make it persistent with a systemd unit:
+Leave it running (`-d` prints packets — drop that flag once it works).
+
+**Make it permanent** — `/etc/systemd/system/mqtt-vpn.service`:
 
 ```ini
-# /etc/systemd/system/mqtt-vpn.service
 [Unit]
 Description=MQTT VPN tunnel client
 After=network-online.target
 
 [Service]
-ExecStart=/home/pi/MQTT_VPN/linux/mqtt_vpn -i mq0 -a 10.0.1.1 -b tls://HOST:8883 -u vpnuser -p PASS -k KEY
+ExecStart=/home/pi/MQTT_VPN/linux/mqtt_vpn -i mq0 -a 10.0.1.1 -b tls://BROKER_HOST:8883 -u vpnuser -p BROKER_PASSWORD -k your-preshared-key
 Restart=always
 RestartSec=5
 
@@ -124,134 +140,165 @@ WantedBy=multi-user.target
 ```
 
 ```bash
+sudo systemctl daemon-reload
 sudo systemctl enable --now mqtt-vpn
 ```
 
-## 4. Flash the ESP8266
+**Sanity check on the Pi:** `mosquitto_sub -h localhost -t 'mqttip/#' -d`
+should show traffic once the ESP is connected (Step 2).
+
+---
+
+# Step 2 — Set up the WeMos D1 Mini (ESP8266 hotspot)
+
+You need a **PC/laptop with the Arduino IDE** to flash it. It takes ~10
+minutes; you only do this once (and again whenever you change the key or
+WiFi).
+
+### 2.1 Install the toolchain (on the flashing PC)
 
 1. Install the [Arduino IDE](https://www.arduino.cc/en/software).
-2. **File → Preferences → Additional Board Manager URLs**:
+2. **File → Preferences → Additional Board Manager URLs**, add:
    `http://arduino.esp8266.com/stable/package_esp8266com_index.json`
-3. **Boards Manager** → install **esp8266 by ESP8266 Community**; select your board.
-4. Copy the `mqtt_vpn_arduino` library folder from the MQTT_VPN repo ZIP into
-   `~/Arduino/libraries/`, restart the IDE.
-5. Open `firmware/mqtt_vpn_hotspot.ino` (in a folder of the same name) and edit
-   the CONFIG block at the top.
+3. **Tools → Board → Boards Manager** → install **esp8266 by ESP8266
+   Community** (needs version 3.x or newer for enterprise WiFi support).
+4. **Tools → Board** → select **LOLIN(WEMOS) D1 R2 & mini** (or NodeMCU 1.0).
 
-### Uplink WiFi — username & password
+### 2.2 Install the MQTT_VPN Arduino library
 
-The uplink is the network the ESP itself uses to reach the broker. The
-firmware supports two modes, controlled by `UPLINK_USES_ENTERPRISE`:
+Download the [MQTT_VPN repo ZIP](https://github.com/martin-ger/MQTT_VPN),
+unzip it, and copy the `mqtt_vpn_arduino` folder into your Arduino libraries
+folder (`~/Arduino/libraries/` on Linux/macOS,
+`Documents\Arduino\libraries\` on Windows). Restart the IDE.
 
-| Mode | Set this | When to use |
-|---|---|---|
-| **Regular WPA2** (default) | `UPLINK_SSID` + `UPLINK_PASSWORD` | Home/office WiFi with a normal passphrase |
-| **WPA2-Enterprise (PEAP/MSCHAPv2)** | `UPLINK_SSID` + `UPLINK_USERNAME` + `UPLINK_PASSWORD`, `UPLINK_USES_ENTERPRISE = true` | School/campus WiFi that asks for a **username and password** (e.g. "eduroam"-style networks) |
+### 2.3 Configure and flash the sketch
 
-This is what "per your wifi rules" means in practice: if your network policy
-requires individual username/password login (802.1X), set
-`UPLINK_USES_ENTERPRISE` to `true` and fill in the account the network rules
-assign to you. Hosted networks that only need a shared key stay on the default
-mode.
+1. Put [`code/firmware/mqtt_vpn_hotspot.ino`](code/firmware/mqtt_vpn_hotspot.ino)
+   in a folder of the same name (`mqtt_vpn_hotspot/mqtt_vpn_hotspot.ino`) and
+   open it in the IDE.
+2. Edit the **CONFIG** block at the top:
 
-Also set:
+   | Setting | What to put |
+   |---|---|
+   | `UPLINK_SSID` / `UPLINK_PASSWORD` | The WiFi the **WeMos itself** joins to reach the broker (e.g. your home WiFi, or a phone hotspot). Must not block port 8883. |
+   | `UPLINK_USES_ENTERPRISE` | `1` only if that WiFi needs a **username + password** login (school/campus 802.1X) — then also set `UPLINK_USERNAME`. |
+   | `ap_ssid` / `ap_password` | The hotspot **users** join. Password ≥ 8 chars; never leave it open. |
+   | `broker` / `broker_port` | `BROKER_HOST` from Step 1.2, port `8883`. |
+   | `broker_username` / `broker_password` | `vpnuser` + the password from Step 1.1. |
+   | `vpn_password` | The **same preshared key** as `-k` on the Pi (Step 1.5). |
+   | `mqtt_vpn_addr` | Leave at `10.0.1.2` unless you changed the Pi. |
 
-- **Hotspot SSID / password** — what the community joins (≥ 8 chars; never run
-  an open hotspot).
-- **Broker** address, port, credentials.
-- **`vpn_password`** (preshared tunnel key) — must match the `-k` on the exit
-  node. Free and paid tiers use different keys (see §6).
-- `mqtt_vpn_addr` — leave at `10.0.1.2` unless you changed the exit node.
+3. Plug the WeMos into the PC with a **data** micro-USB cable, pick the port
+   under **Tools → Port**, and click **Upload**.
+4. Open **Tools → Serial Monitor** at **115200** baud. You should see it join
+   the uplink WiFi, open the hotspot, and start the tunnel.
 
-Flash, then watch **Serial Monitor at 115200** — the heartbeat line shows
-uptime, free heap, and connected clients.
+> Why everyone fits on one ESP: hotspot clients are NATed behind
+> `10.0.1.2`, so the broker sees one topic pair no matter how many users.
+> The real limits are the ESP8266's radio and ~0.3–1 Mbps **shared**
+> bandwidth — plan for 3–5 comfortable simultaneous users.
 
-### Test
+### 2.4 Power it
 
-From the exit node: `ping 10.0.1.2`. From a joined device: `curl ifconfig.me`
-should return the **exit node's** IP.
+After flashing, unplug from the PC and power the WeMos from any USB charger /
+power bank (5V, ≥ 500 mA). Place it near where users will be.
 
-## 5. Connect users
+---
 
-With the hotspot firmware, every device just joins the ESP's WiFi — DHCP and
-routing are automatic. Verify exit with `curl ifconfig.me` (crosh on
-Chromebook).
+# Step 3 — Set up the Chromebook (client)
 
-## 6. Tiers — free vs. paid
+Nothing to install. Each user:
 
-Both tiers use the same firmware and get identical encryption; the tier only
-changes **which preshared key** devices use, which maps to QoS on the exit
-node.
+1. **Settings → Network → Wi-Fi** → join the hotspot from Step 2
+   (default `CommunityVPN`), enter the hotspot password.
+2. That's it — DHCP hands out addresses and routing automatically.
+
+**Verify it works** — open Chrome, or press `Ctrl+Alt+T` → type `shell` → run:
+
+```
+curl ifconfig.me
+```
+
+It should return the **Raspberry Pi's public IP** (Step 1.2), not the local
+network's. If it does, all traffic is exiting through the Pi.
+
+---
+
+# Quick checklist
+
+- [ ] Pi: Mosquitto installed, password created, TLS cert generated, port 8883 reachable from outside
+- [ ] Pi: `mqtt_vpn` built, `ip_forward=1`, MASQUERADE rule, service running
+- [ ] WeMos: flashed with matching broker address/credentials and the **same** preshared key as the Pi
+- [ ] Chromebook: joins hotspot → `curl ifconfig.me` shows the Pi's IP
+
+# Troubleshooting
+
+| Symptom | Likely cause / fix |
+|---|---|
+| WeMos won't join uplink WiFi | Wrong SSID/password; 5 GHz network (ESP8266 is 2.4 GHz only); campus WiFi needing username/password → set `UPLINK_USES_ENTERPRISE 1` + `UPLINK_USERNAME` |
+| Enterprise auth fails | Wrong username/password or anonymous identity; check Serial output at 115200 |
+| No broker connection | Port 8883 not forwarded/open; wrong `tls://` vs `tcp://`; HiveMQ-style cloud broker required but not used |
+| Self-signed cert rejected | Linux client must trust `ca.crt`; the ESP client in MQTT_VPN uses plain TCP — if TLS fails on the ESP, add a plain listener on port 8899 (tunnel contents still encrypted by the preshared key) |
+| `ping 10.0.1.2` from Pi fails | Preshared key mismatch (`-k` vs `vpn_password`); tunnel IPs not in the same /24 |
+| Chromebook online but `curl ifconfig.me` shows local IP | Pi missing `ip_forward=1` or the MASQUERADE rule |
+| Works, then stalls after minutes | ESP8266 heap exhaustion — power-cycle, reduce users, or lower NAPT entries |
+| Many users, very slow | Normal: 0.3–1 Mbps is **shared**; plan 3–5 comfortable users |
+
+Debug: `mosquitto_sub` on the Pi shows packets flowing; Serial Monitor (115200)
+shows the ESP's WiFi/broker state; `mqtt_vpn -d` prints each tunneled packet.
+
+---
+
+# Tiers — free vs. paid (optional)
+
+Both tiers use the same devices; the tier only changes **which preshared key**
+devices use, which maps to quality of service on the Pi.
 
 | | **Free** | **Supporter ($5/mo)** |
 |---|---|---|
 | Tunnel access | ✅ Standard key | ✅ Priority key |
-| Bandwidth | Best-effort, deprioritized at peak | QoS priority on the exit node |
+| Bandwidth | Best-effort, deprioritized | QoS priority on the Pi |
 | Sessions | 2 devices | 5 devices |
 | Support | Community | Priority |
 
 Payments run through **Dodo Payments** (Merchant of Record — handles sales
-tax/VAT). The webhook receiver in `api/webhooks/dodo/` provisions a unique
-`vip-<random>` key on `subscription.created` and deactivates it on expiry or
-cancellation. See `api/webhooks/dodo/README.md`.
+tax/VAT). The webhook receiver in
+[`code/webhook/webhook_server.py`](code/webhook/webhook_server.py) provisions
+a unique `vip-<random>` key on subscription and deactivates it on expiry — see
+[`docs/dodo-webhook-receiver.md`](docs/dodo-webhook-receiver.md).
 
-### Exit-node QoS
+To run both tiers you need a **second WeMos** (an ESP hotspot can only hold
+one key/SSID): flash one with the standard key (SSID `CommunityVPN`, topic
+prefix `mqttip`), one with the priority key (SSID `CommunityVPN-VIP`, prefix
+`mqttipvip`), and run **two** `mqtt_vpn` instances on the Pi
+(`-i mq0 -a 10.0.1.1` and `-i mq1 -a 10.0.2.1`). Prioritize paid traffic:
 
 ```bash
-# Priority queue: paid (mq1) traffic preferred under load
 sudo tc qdisc add dev eth0 root handle 1: prio bands 3
 sudo tc filter add dev eth0 parent 1: protocol ip prio 1 u32 match ip iif mq1 0 0 flowid 1:1
 sudo tc filter add dev eth0 parent 1: protocol ip prio 3 u32 match ip iif mq0 0 0 flowid 1:3
-
-# Cap free tier at 4 Mbit so heavy free users can't starve supporters
-sudo tc qdisc add dev mq0 root tbf rate 4mbit burst 32kbit latency 50ms
+sudo tc qdisc add dev mq0 root tbf rate 4mbit burst 32kbit latency 50ms  # cap free tier
 ```
 
-Run **two instances** of the client and firmware (one per tier), with separate
-tunnel IPs (`10.0.1.x` / `10.0.2.x`) and broker topic prefixes (`mqttip` /
-`mqttipvip`). If you use one shared ESP hotspot, you need **two ESPs** — one
-flashed per tier, serving two SSIDs (e.g. `CommunityVPN` and
-`CommunityVPN-VIP`) — the simplest honest way to sell "priority".
+(Use your real outbound interface instead of `eth0`.)
 
-`keys.json` (written by the webhook receiver) maps member IDs to keys and
-active/inactive status; cron a small script every 5 min to reload it and drop
-inactive keys.
+---
 
-## 7. Troubleshooting
+# Honest limitations & responsibility
 
-| Symptom | Likely cause / fix |
-|---|---|
-| ESP won't join WiFi | Wrong SSID/credentials; 5 GHz network (ESP8266 is 2.4 GHz only); enterprise WiFi without `UPLINK_USES_ENTERPRISE = true` |
-| Enterprise auth fails | Wrong username/password; wrong anonymous identity; network requires a specific CA — check Serial output |
-| No broker connection | Firewall blocks 8883; wrong scheme (`tls://` vs `tcp://`) |
-| `ping 10.0.1.2` fails | Preshared key mismatch (`-k` vs sketch); tunnel IPs not on the same /24 |
-| Tunnel up, no internet | Exit node missing `ip_forward=1` or MASQUERADE rule |
-| Stalls after minutes | ESP8266 heap exhaustion — reduce NAPT / users / power-cycle |
-| Many users, very slow | Normal: 0.3–1 Mbps **shared**; plan 3–5 comfortable users |
-
-Debug: `mosquitto_sub -h BROKER -p 8883 -u vpnuser -P PASS -t 'mqttip/#' -d`,
-Serial Monitor on the ESP, or `mqtt_vpn -d` on the exit node.
-
-## 8. Honest limitations & responsibility
-
-- **~0.3–1 Mbps throughput** — fine for browsing, painful for video.
+- **~0.3–1 Mbps shared throughput** — fine for browsing, painful for video.
 - All tunnel traffic is encrypted with libnacl; the broker sees only traffic
-  patterns, not contents. Packet replay at the MQTT layer is possible.
-- One exit node = everyone shares its bandwidth and public IP. Publish a
-  privacy policy and acceptable-use policy; you're responsible for what leaves
-  your exit node.
-- If you charge money you're a service provider — Dodo acts as Merchant of
-  Record for tax, but check local regulations for operating proxy services.
+  patterns, not contents. MQTT-layer packet replay is possible.
+- **Everything exits from the Pi** — its IP, its bandwidth, its
+  responsibility. Publish a privacy policy and acceptable-use policy.
+- If you charge money you're a service provider — check local regulations
+  (Dodo handles sales tax as Merchant of Record).
 - Bypassing a school/organization's filtering usually violates its
   acceptable-use policy. Know the rules you're working under.
-
-## 9. Key rotation & uptime
-
-- **Rotate keys:** change `vpn_password` on the exit node (`-k`) and in every
-  ESP sketch, then reflash — revokes everyone at once.
-- **Fairness:** the ESP has no per-user limits; run several ESPs as you grow.
-- **Uptime:** the ESP can hang under load; a smart plug rebooting it nightly is
-  a cheap fix.
+- **Key rotation:** change `vpn_password` in the sketch + `-k` on the Pi and
+  reflash to revoke everyone at once.
+- **Uptime:** the ESP can hang under load; a smart plug that power-cycles it
+  nightly is a cheap fix.
 
 ## Credits
 

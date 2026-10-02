@@ -3,6 +3,8 @@
 Receives subscription webhooks from Dodo Payments and writes `keys.json`,
 which the exit node reads to map supporters to their priority tunnel key.
 
+**Code:** [`code/webhook/webhook_server.py`](../code/webhook/webhook_server.py)
+
 ## Run
 
 ```bash
@@ -41,4 +43,4 @@ In the Dodo dashboard, set the webhook URL to
 ```
 
 Only members with `"status": "active"` are allowed through the paid tunnel —
-see the tier/QoS section in the root [README](../../README.md).
+see the tier/QoS section in the root [README](../README.md).

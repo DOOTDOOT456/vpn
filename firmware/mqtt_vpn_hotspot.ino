@@ -10,6 +10,11 @@
  *   - tunnels the traffic through an MQTT broker to a Linux exit node with
  *     internet access.
  *
+ * Uplink WiFi supports BOTH rules:
+ *   - Regular WPA2 (shared passphrase), or
+ *   - WPA2-Enterprise PEAP/MSCHAPv2 (username + password, e.g. school WiFi).
+ *     Set UPLINK_USES_ENTERPRISE to 1 and fill in the username.
+ *
  * Because every hotspot client is masqueraded behind the one tunnel address
  * (10.0.1.2), the broker only ever sees one topic pair — the number of
  * hotspot users is NOT limited by the library's 8-topic subscription limit.
@@ -24,10 +29,14 @@
 
 /* ------------------------- CONFIG — edit these ------------------------- */
 
-// Uplink network: the WiFi the ESP uses to reach the broker.
-// NOTE: this network must NOT block the broker port (e.g. 8883).
-const char* uplink_ssid     = "...";
-const char* uplink_password = "...";
+// --- Uplink WiFi: the network the ESP uses to reach the broker. -----------
+// Set UPLINK_USES_ENTERPRISE to 1 for networks that require a USERNAME and
+// PASSWORD login (802.1X PEAP/MSCHAPv2); otherwise 0 uses the shared key.
+#define UPLINK_USES_ENTERPRISE 0
+#define UPLINK_SSID             "..."
+#define UPLINK_PASSWORD         "..."            // used in BOTH modes
+#define UPLINK_USERNAME         "user@school.edu" // enterprise mode only
+#define UPLINK_ANON_IDENTITY    ""                // optional outer identity
 
 // Hotspot opened by the ESP for everyone.
 // ap_password must be >= 8 chars, or use "" for an OPEN hotspot (anyone in
@@ -37,10 +46,10 @@ const char* ap_password = "changeme8";
 
 // MQTT broker
 char* broker            = "...";        // hostname or IP
-int   broker_port       = 1883;         // use 8883 for TLS if your broker has it
+int   broker_port       = 8883;         // TLS; use 1883 for plain if configured
 char* broker_username   = "...";
 char* broker_password   = "...";
-char* broker_topic_prefix = "mqttip";
+char* broker_topic_prefix = "mqttip";   // free tier; paid = "mqttipvip"
 
 // VPN preshared key — MUST match the -k value on the Linux exit node.
 char* vpn_password = "secret";
@@ -58,6 +67,49 @@ IPAddress mqtt_vpn_addr(10, 0, 1, 2);
 
 struct mqtt_if_data *my_if;
 
+/* ---------------------------------------------------------------------------
+ * Uplink: connect per the configured WiFi rules (WPA2-PSK or enterprise).
+ * Returns true once the station has an IP.
+ * ------------------------------------------------------------------------- */
+static bool connectUplink() {
+  Serial.printf("[WiFi] connecting to \"%s\" (%s)\n", UPLINK_SSID,
+                UPLINK_USES_ENTERPRISE ? "WPA2-Enterprise" : "WPA2-PSK");
+
+  if (UPLINK_USES_ENTERPRISE) {
+    /* 802.1X PEAP/MSCHAPv2 — username/password login per network rules. */
+    wifi_station_disconnect();
+
+    struct station_config conf;
+    memset(&conf, 0, sizeof(conf));
+    strncpy((char *)conf.ssid, UPLINK_SSID, sizeof(conf.ssid) - 1);
+    wifi_station_set_config(&conf);
+
+    esp_wpa2_set_username((uint8_t *)UPLINK_USERNAME, strlen(UPLINK_USERNAME));
+    esp_wpa2_set_password((uint8_t *)UPLINK_PASSWORD, strlen(UPLINK_PASSWORD));
+    if (strlen(UPLINK_ANON_IDENTITY) > 0) {
+      esp_wpa2_set_identity((uint8_t *)UPLINK_ANON_IDENTITY,
+                            strlen(UPLINK_ANON_IDENTITY));
+    }
+    wifi_station_set_wpa2_enterprise_auth(1);
+    wifi_station_connect();
+  } else {
+    WiFi.begin(UPLINK_SSID, UPLINK_PASSWORD);
+  }
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    if (millis() - start > 30000) {
+      Serial.println("[WiFi] FAILED (check SSID / username / password)");
+      return false;
+    }
+    delay(250);
+  }
+  Serial.printf("[WiFi] connected, IP %s\n", WiFi.localIP().toString().c_str());
+  return true;
+}
+
+/* ---------------------------------------------------------------------------
+ */
 void setup() {
   Serial.begin(115200);
   delay(10);
@@ -67,22 +119,14 @@ void setup() {
   /* 1. Bring up the hotspot for the community FIRST */
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(ap_ssid, ap_password);
-  Serial.print("Hotspot '");
-  Serial.print(ap_ssid);
-  Serial.print("' up, AP IP: ");
-  Serial.println(WiFi.softAPIP().toString());
+  Serial.printf("Hotspot '%s' up, AP IP: %s\r\n", ap_ssid,
+                WiFi.softAPIP().toString().c_str());
 
-  /* 2. Connect the uplink (path to the broker) */
-  Serial.print("Connecting uplink to ");
-  Serial.println(uplink_ssid);
-  WiFi.begin(uplink_ssid, uplink_password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  /* 2. Connect the uplink (path to the broker). Retry — enterprise networks
+   *    sometimes need more than one attempt. */
+  while (!connectUplink()) {
+    delay(5000);
   }
-  Serial.println();
-  Serial.print("Uplink connected, IP: ");
-  Serial.println(WiFi.localIP().toString());
 
   /* Use a public DNS resolver (reached through the tunnel) so clients'
    * DNS queries are not answered or hijacked by the local network. */
@@ -116,6 +160,8 @@ void setup() {
   }
 }
 
+/* ---------------------------------------------------------------------------
+ */
 void loop() {
   /* Heartbeat so you can watch it in the Serial Monitor */
   static uint32_t last = 0;

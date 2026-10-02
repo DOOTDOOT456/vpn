@@ -6,10 +6,16 @@ MQTT broker to an exit node on an uncensored network. Based on
 
 **Read the full guide: [SETUP.md](SETUP.md)**
 
+Ready-made community firmware: [`firmware/mqtt_vpn_hotspot.ino`](firmware/mqtt_vpn_hotspot.ino) — the ESP opens its own WiFi hotspot and NATs **all** connected users through the tunnel, no per-device config needed.
+
 ## How it works
 
 ```
-Chromebook ──WiFi──> ESP8266 (NAT) ──MQTT broker──> Linux exit node ──> Open Internet
+                      +---------------------------+
+  Chromebooks,        |         ESP8266           |
+  laptops, phones ───>│  WiFi hotspot + NAT       │──MQTT broker──> Linux exit node ──> Open Internet
+  (everyone)          |  (single tunnel IP)       |
+                      +---------------------------+
 ```
 
 - The ESP8266 runs the `mqtt_vpn_nat` sketch from MQTT_VPN. It acts as a NAT
